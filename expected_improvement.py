@@ -29,6 +29,7 @@ from scipy.stats import norm
 from scipy.optimize import minimize
 from compute_flops import compute_flops
 from dependency_criterion import *
+from scipy.optimize import NonlinearConstraint
 
 
 num_blocks = 12
@@ -129,9 +130,50 @@ def expected_improvement(x, gaussian_process, evaluated_loss, greater_is_better=
     return -1 * expected_improvement
 
 
+def random_point(flops_target, population, lb, ub, n_params, flops_mode):
+	res = []
+	while len(res) < population:
+		ratio = (np.random.uniform(lb, ub, size=(1, n_params))[0]).tolist()
+		if flops_mode == 'small':
+			flops = compute_flops(384, 4, 197, 6, ratio[:12], ratio[12:24], ratio[-1]) # DEIT-S
+		elif flops_mode == 'base':
+			flops = compute_flops(768, 4, 197, 12, ratio[:12], ratio[12:24], ratio[-1]) # DEIT-B
+		if abs(flops - flops_target) <= 0.02 * flops_target:
+			if ratio not in res:
+				res.append(ratio)
+	return res[0]
+
+
+def flops_constraint(x, embed=384, mlp_ratio=4, seq_length=197, head=6, TSL=[0,0,0,1,0,0,1,0,0,1,0,0]):
+	neuron_sparsity = x[:12]
+	head_sparsity = x[12:24]
+	token_sparsity = x[-1]
+	temp = 1 - token_sparsity
+	token_sparsity = [0.]*3 + [1-temp]*3 + [1-temp**2]*3 + [1-temp**3]*3
+	res = 0
+	old_t = 0
+	for n, h, t, s in zip(neuron_sparsity, head_sparsity, token_sparsity, TSL):
+		if s == 0:
+			# FFN
+			res += 2 * int(seq_length*(1-t)) * embed * int(embed * mlp_ratio * (1-n))
+			# MHSA
+			chunk = embed / head
+			per_head = 4 * embed * chunk * int(seq_length*(1-t)) + int(seq_length*(1-t))**2 * chunk * 2
+			res += per_head * int(head * (1-h))
+		else:
+			# FFN
+			res += 2 * int(seq_length*(1-t)) * embed * int(embed * mlp_ratio * (1-n))
+			# MHSA
+			chunk = embed / head
+			per_head = 4 * embed * chunk * int(seq_length*(1-old_t)) + int(seq_length*(1-old_t))**2 * chunk * 2
+			res += per_head * int(head * (1-h))
+		old_t = t
+	return res / 1e9
+
+
 def bayesian_optimisation(
     model, data_loader_val, n_params, n_iters, flops_target, neuron_rank, head_rank, device, population, lb, ub, flops_mode,
-    gp_params=None, random_search=True,
+    gp_params=None, random_search=False,
     ):
 
 	x_list = []
@@ -183,7 +225,11 @@ def bayesian_optimisation(
 			ei = -1 * expected_improvement(x_random, gp_model, yp, greater_is_better=True, n_params=n_params)
 			next_sample = x_random[np.argmax(ei), :]
 		else:
-			pass
+			res = minimize(lambda x: -1 * expected_improvement(x, gp_model, yp, greater_is_better=True, n_params=n_params), 
+				x0=random_point(flops_target=flops_target, population=1, lb=lb, ub=ub, n_params=n_params, flops_mode=flops_mode), 
+				method='trust-constr',
+				constraints=NonlinearConstraint(lambda x: flops_constraint(x), 0, flops_target))
+			next_sample = res.x
 
 		# Sample loss for new set of parameters
 		mlp_neuron_prune(model.module, mlp_neuron_mask(model.module, next_sample.tolist()[:12], neuron_rank))
